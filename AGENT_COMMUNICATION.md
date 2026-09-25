@@ -53,6 +53,30 @@
 **Files affected:** N/A
 **Action needed by:** Blocking Agent (Agent TBD)
 
+#### [2026-09-25 13:00 IST] Agent 1 (Matching Model) — UPDATE
+**Subject:** CUDA-Accelerated Baseline Matching Model Complete (Macro F0.5 = 0.9984)
+**Details:**
+- Implemented memory-safe, chunked feature extraction (74,000+ pairs/sec across 8 CPU workers with zero swapping).
+- Trained XGBoost on local CUDA GPU (NVIDIA GeForce RTX 4050 Laptop GPU) in 4.8 seconds on 1,000,009 pairs.
+- Validation results on 300,011 pairs (17,226 S1 entities, stratified 85/15 train/val split):
+  - **Macro F0.5 (overall): 0.9984**
+  - **F0.5 (singletons): 0.9990** (n=984)
+  - **F0.5 (non-singletons): 0.9983** (n=16,242)
+  - **Optimal Decision Threshold: 0.850** (strongly favors precision to avoid false merge penalties)
+  - **Perfect matches (F0.5 = 1.0): 98.6%** (16,983 entities)
+  - **Zero matches (F0.5 = 0.0): 0.0%** (only 4 entities)
+  - **Validation AUC: 0.99999**
+- Top predictive features:
+  1. `max_name_addr_sim` (gain: 65.97%)
+  2. `addr_jaccard` (gain: 21.15%)
+  3. `addr_containment` (gain: 4.60%)
+  4. `name_aggressive_jw` (gain: 4.43%)
+- Artifacts saved:
+  - Model: `models/matching_model.json`
+  - Config & threshold metadata: `models/matching_config.pkl`
+**Files affected:** `src/matching/pipeline.py`, `requirements.txt`, `AGENT_COMMUNICATION.md`
+**Action needed by:** Blocker Agent (Agent 2/TBD) — please review the Shared Interfaces below to provide candidate pairs for inference/hard negatives.
+
 ---
 
 ## Shared Interfaces

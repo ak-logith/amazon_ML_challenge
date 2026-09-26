@@ -95,7 +95,23 @@
   - `get_blocking_keys(entity)`: Instant blocking key extraction (`postal_code`, `city_state`, `name_first_token`, `country`) for Agent 2.
 - Full test suite in `tests/test_preprocessing.py` passing (10/10 tests OK).
 **Files affected:** `src/preprocessing/config.py`, `src/preprocessing/normalizer.py`, `src/preprocessing/run_preprocess.py`, `src/preprocessing/interface.py`, `tests/test_preprocessing.py`, `requirements.txt`, `AGENT_COMMUNICATION.md`
-**Action needed by:** Agent 1 (Matching Model) and Agent 2 (Blocking) — review Preprocessing → Downstream interface below.
+#### [2026-09-26 10:35 IST] Agent 3 (Data Preprocessing & Normalization) — UPDATE
+**Subject:** Shared Data-Loading Layer & Comprehensive Test Suite Complete (64/64 tests passing)
+**Details:**
+- Implemented `src/preprocessing/loader.py` with standard data loading utilities:
+  - `load_raw_source(path, return_type="dict" | "polars")`: Robust TSV loader (`sep="\t"`, Utf8 schema overrides for lossless entity_id preservation, safe null literal handling).
+  - `load_raw_source_matching(path)`: Drop-in Polars-backed replacement for matching pipeline's `load_source()` (`{entity_id: {"name": ..., "addr": ..., "country": ...}}`).
+  - `load_preprocessed_source(path, columns=None, return_type="dict" | "polars")`: Loads 15-column preprocessed clean TSVs.
+  - `preprocess_raw_source(path, return_type="dict" | "polars")`: On-the-fly streaming normalization for raw TSVs.
+  - `load_ground_truth(path)`: Safe ground truth loader returning `{s1_id: set(matches)}` supporting both column header variants.
+- Normalization enhancements:
+  - Refined head/prefix legal token extraction in `src/preprocessing/normalizer.py` using `C.LEGAL_PREFIXES` to avoid erroneously stripping core name nouns like "Société".
+  - Open-set country preservation across all modules.
+- Test Suite:
+  - Created `tests/test_loader_and_normalization.py` (54 comprehensive test cases covering raw TSV loading, entity_id preservation, missing value safety, name/address normalization, open-set country, compatibility with downstream models, ground truth parsing, round-trip processing, and low-level unicode/indic transliteration).
+  - All 64 tests across `test_loader_and_normalization.py` and `test_preprocessing.py` are passing.
+**Files affected:** `src/preprocessing/loader.py`, `src/preprocessing/__init__.py`, `src/preprocessing/config.py`, `src/preprocessing/normalizer.py`, `tests/test_loader_and_normalization.py`, `AGENT_COMMUNICATION.md`
+**Action needed by:** Agent 1 & Agent 2 — use `from src.preprocessing import load_raw_source, load_preprocessed_source, load_raw_source_matching, load_ground_truth` for unified data loading.
 
 ---
 
@@ -122,9 +138,15 @@ Columns (Tab-Separated):
  14. addr_state         : Extracted canonical state/region code or name
  15. addr_postal_code   : Extracted 5-digit ZIP / 6-digit PIN / French postal code
 
-Python helper:
-  from src.preprocessing.interface import load_entities, get_blocking_keys
-  records = load_entities("dataset/preprocessed/train/train_source1_clean.tsv", return_type="dict")
+Python helpers:
+  from src.preprocessing import (
+      load_raw_source,
+      load_raw_source_matching,
+      load_preprocessed_source,
+      preprocess_raw_source,
+      load_ground_truth,
+      get_blocking_keys,
+  )
 ```
 
 ### Blocking → Matching Model
@@ -153,7 +175,7 @@ Output: macro F0.5 score, per-entity breakdown
 | Component | Status | Last Updated | Current Score / Output |
 |-----------|--------|-------------|------------------------|
 | Data Analysis | ✅ Complete | 2026-09-25 11:39 | Full EDA & report |
-| Data Cleaning & Normalization | ✅ Complete | 2026-09-25 14:20 | 24,229,173 clean records across 6 TSVs |
+| Data Cleaning & Normalization | ✅ Complete | 2026-09-26 10:35 | 24,229,173 clean records + Shared Loader + 64/64 tests passing |
 | Blocking/Candidate Gen | ⏳ Pending (Agent 2) | — | — |
 | Feature Engineering | 🔨 In Progress | 2026-09-25 11:39 | 23 pairwise features implemented |
 | Matching Model | ✅ Baseline Complete | 2026-09-25 13:00 | XGBoost CUDA Macro F0.5 = 0.9984 |

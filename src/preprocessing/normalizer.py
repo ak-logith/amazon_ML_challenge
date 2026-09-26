@@ -125,9 +125,9 @@ def _extract_legal_suffix(tokens: list[str]) -> tuple[list[str], str]:
             suffix_parts.insert(0, canonical)
 
     # --- single-token suffixes at the head (e.g. "LLC Crystal …") ---
-    while remaining and remaining[0] in C.LEGAL_SUFFIX_MAP:
+    while remaining and len(remaining) > 1 and remaining[0] in getattr(C, "LEGAL_PREFIXES", set()):
         tok = remaining.pop(0)
-        canonical = C.LEGAL_SUFFIX_MAP[tok]
+        canonical = C.LEGAL_SUFFIX_MAP.get(tok, tok)
         if canonical not in suffix_parts:
             suffix_parts.append(canonical)
 

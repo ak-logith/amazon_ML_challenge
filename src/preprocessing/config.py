@@ -61,7 +61,6 @@ LEGAL_SUFFIX_MAP: dict[str, str] = {
     "association":  "assn",
     "assn":         "assn",
     "society":      "society",
-    "societe":      "societe",
     # French legal forms (test set)
     "sarl":         "sarl",
     "s.a.r.l.":     "sarl",
@@ -79,6 +78,12 @@ LEGAL_SUFFIX_MAP: dict[str, str] = {
     "nidhi":        "nidhi",
     "opc":          "opc",
     "section-8":    "sec8",
+}
+
+# Prefixes that can appear before the company name (e.g., LLC Crystal)
+LEGAL_PREFIXES: set[str] = {
+    "llc", "l.l.c.", "llp", "l.l.p.", "inc", "inc.",
+    "corp", "corp.", "sarl", "sas", "sasu", "eurl", "gmbh",
 }
 
 # Multi-word legal suffixes (order matters — longest first).

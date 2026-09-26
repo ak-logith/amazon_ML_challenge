@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Unit tests for Candidate Generation & Blocking Engine (V3)
+Unit and Integration tests for Candidate Generation & Blocking Engine (V4)
 """
 
 import unittest
 from pathlib import Path
 from src.generate_candidates import (
     _norm,
+    _translit_clean,
     _name_tokens,
     _name_prefixes,
     _addr_tokens,
@@ -16,20 +17,31 @@ from src.generate_candidates import (
     _dec,
     SUFFIXES,
     ADDR_STOPS,
+    BUDGET_MIN,
+    BUDGET_MAX,
+    FALLBACK_TRIGGER,
 )
 
 
-class TestCandidateGenerationV3(unittest.TestCase):
+class TestCandidateGenerationV4(unittest.TestCase):
 
     def test_normalization_and_diacritics(self):
         # US / English
         self.assertEqual(_norm("Walmart Inc."), "walmart inc")
         # French diacritics
         self.assertEqual(_norm("Société Générale & Cie"), "societe generale cie")
-        # Hindi / non-latin unicode normalization
-        self.assertTrue(len(_norm("राम मार्केटिंग")) > 0)
         # Whitespace and punctuation collapsing
         self.assertEqual(_norm("  A & B   Co.  "), "a b co")
+
+    def test_transliteration_clean(self):
+        # Indic transliteration to ASCII
+        t_hindi = _translit_clean("राम मार्केटिंग")
+        self.assertTrue(len(t_hindi) > 0)
+        self.assertTrue(all(ord(c) < 128 for c in t_hindi))
+
+        # French accents
+        t_fr = _translit_clean("Électricité de France")
+        self.assertIn("electricite", t_fr)
 
     def test_name_tokens_and_suffix_removal(self):
         # US legal suffix
@@ -50,6 +62,14 @@ class TestCandidateGenerationV3(unittest.TestCase):
         self.assertIn("retail", tokens_in)
         self.assertNotIn("pvt", tokens_in)
         self.assertNotIn("ltd", tokens_in)
+
+    def test_name_tokens_script_resilience(self):
+        # Transliterated tokens are added alongside original tokens
+        tokens = _name_tokens("संजय ट्रेडर्स")
+        self.assertTrue(len(tokens) > 0)
+        # Should contain ascii transliterated tokens like 'snjy' or 'ttreddrs'
+        self.assertTrue(any(t.isascii() and len(t) >= 3 for t in tokens))
+        self.assertTrue(any("snjy" in t.lower() for t in tokens))
 
     def test_name_prefixes(self):
         prefs = _name_prefixes("Microsoft Technologies Corporation", length=5)
@@ -107,11 +127,10 @@ class TestCandidateGenerationV3(unittest.TestCase):
         self.assertEqual(_dec(code_s3), "S3-789012")
 
 
-class TestV3BlockingEngineIntegration(unittest.TestCase):
-    """End-to-end integration and behavioral tests for V3 multi-channel blocking."""
+class TestV4BlockingEngineIntegration(unittest.TestCase):
+    """End-to-end integration tests for V4 blocking architecture."""
 
     def setUp(self):
-        import io
         import tempfile
         self.temp_dir = tempfile.TemporaryDirectory()
         self.d = self.temp_dir.name
@@ -119,130 +138,222 @@ class TestV3BlockingEngineIntegration(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_open_set_country_and_multichannel_blocking(self):
-        """Verify open-set country handling (France, Germany) and S2/S3 candidate generation."""
-        import os
-        from io import StringIO
-        from src.generate_candidates import _build_indexes, _generate_country_v3
-
-        s2_path = os.path.join(self.d, "s2.tsv")
-        s3_path = os.path.join(self.d, "s3.tsv")
-        s1_path = os.path.join(self.d, "s1.tsv")
-
-        # Create France data with both S2 and S3
-        with open(s2_path, "w", encoding="utf-8") as f:
-            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
-            f.write("S2-101\tBoulangerie Patisserie Pierre\t14 Rue de Rivoli, Paris 75001\tFrance\n")
-            f.write("S2-102\tPharmacie de la Mairie\t8 Avenue des Champs, Lyon 69001\tFrance\n")
-
-        with open(s3_path, "w", encoding="utf-8") as f:
-            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
-            f.write("S3-201\tPierre Boulangerie Artisanal\t14 Rue Rivoli\tFrance\n")
-            f.write("S3-202\tUnrelated Corp\t99 Other Street\tFrance\n")
-
-        with open(s1_path, "w", encoding="utf-8") as f:
-            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
-            f.write("S1-1\tPierre Boulangerie\t14 Rue de Rivoli, Paris\tFrance\n")
-            f.write("S1-2\tPharmacie Mairie\tLyon\tFrance\n")
-            f.write("S1-3\tCompletely Unknown Unique Business\tNowhere Land\tFrance\n")
-
-        ni, pi, ai, pos_i, fpi, rare_tokens = _build_indexes(s2_path, s3_path, "France")
-        out_buf = StringIO()
-
-        stats = _generate_country_v3(
-            s1_path=s1_path,
-            country="France",
-            ni=ni,
-            pi=pi,
-            ai=ai,
-            pos_i=pos_i,
-            fpi=fpi,
-            rare_tokens=rare_tokens,
-            gt_arr=None,
-            out_fh=out_buf,
-        )
-
-        output_lines = [l for l in out_buf.getvalue().split("\n") if l]
-        self.assertEqual(len(output_lines), 3)
-
-        # S1-1 should find both S2-101 and S3-201 (name 'pierre' / addr 'rivoli')
-        s1_1_line = [l for l in output_lines if l.startswith("S1-1\t")][0]
-        cands_1 = s1_1_line.split("\t")[1].split(",")
-        self.assertIn("S2-101", cands_1)
-        self.assertIn("S3-201", cands_1)
-
-        # S1-2 should find S2-102
-        s1_2_line = [l for l in output_lines if l.startswith("S1-2\t")][0]
-        cands_2 = s1_2_line.split("\t")[1].split(",")
-        self.assertIn("S2-102", cands_2)
-
-        # S1-3 has zero overlap
-        s1_3_line = [l for l in output_lines if l.startswith("S1-3\t")][0]
-        self.assertEqual(s1_3_line.split("\t")[1], "")
-
-    def test_quota_protection_prevents_address_displacement(self):
+    def test_removal_of_early_quota_bottleneck(self):
         """
-        Verify that a dense address token matching hundreds of entities
-        does NOT displace a rare, high-specificity name match.
+        Verify that Channel A/B candidates beyond 180 are NOT choked early,
+        and survive into the final candidate set if below BUDGET_MAX.
         """
         import os
         from io import StringIO
-        from src.generate_candidates import (
-            _build_indexes,
-            _generate_country_v3,
-            CHANNEL_B_QUOTA,
-        )
+        from src.generate_candidates import _build_indexes, _generate_country_v4
 
         s2_path = os.path.join(self.d, "s2_quota.tsv")
         s3_path = os.path.join(self.d, "s3_quota.tsv")
         s1_path = os.path.join(self.d, "s1_quota.tsv")
 
-        # 300 S2 entities sharing the dense address 'Cyber City', but completely different names
+        # Create 250 S2 entities all matching name token 'supercorp'
         with open(s2_path, "w", encoding="utf-8") as f:
             f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
-            for i in range(1, 301):
-                f.write(f"S2-{i}\tRandom Firm {i}\tCyber City Tower B\tIndia\n")
+            for i in range(1, 251):
+                f.write(f"S2-{i}\tSupercorp Division {i}\tAddress {i}\tUS\n")
 
-        # 1 S3 entity sharing the rare name 'QuantumXTech' with S1, but different address
         with open(s3_path, "w", encoding="utf-8") as f:
             f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
-            f.write("S3-999\tQuantumXTech Labs\tSomewhere Remote\tIndia\n")
+            f.write("S3-1\tSupercorp Labs\tAddress S3\tUS\n")
 
-        # S1 has rare name 'QuantumXTech' AND dense address 'Cyber City'
         with open(s1_path, "w", encoding="utf-8") as f:
             f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
-            f.write("S1-1\tQuantumXTech\tCyber City Tower B\tIndia\n")
+            f.write("S1-1\tSupercorp Headquarters\tAddress S1\tUS\n")
 
-        ni, pi, ai, pos_i, fpi, rare_tokens = _build_indexes(s2_path, s3_path, "India")
+        ni, pi, ai, pos_i, c3_i, rare_tokens = _build_indexes(s2_path, s3_path, "US")
         out_buf = StringIO()
 
-        stats = _generate_country_v3(
+        # In V3, this was choked at 180. In V4 with budget_max=600, ALL 251 should be retained!
+        stats = _generate_country_v4(
             s1_path=s1_path,
-            country="India",
-            ni=ni,
-            pi=pi,
-            ai=ai,
-            pos_i=pos_i,
-            fpi=fpi,
-            rare_tokens=rare_tokens,
-            gt_arr=None,
-            out_fh=out_buf,
+            country="US",
+            ni=ni, pi=pi, ai=ai, pos_i=pos_i, c3_i=c3_i, rare_tokens=rare_tokens,
+            gt_arr=None, out_fh=out_buf,
+            budget_max=600,
         )
 
-        output_line = out_buf.getvalue().strip()
-        cands = set(output_line.split("\t")[1].split(","))
+        cands = set(out_buf.getvalue().strip().split("\t")[1].split(","))
+        self.assertEqual(len(cands), 251)
+        self.assertIn("S3-1", cands)
+        self.assertIn("S2-250", cands)
 
-        # The rare name candidate S3-999 MUST be retained thanks to Channel A quota protection
-        self.assertIn("S3-999", cands)
-        # The address channel must be capped by its quota, not overflowing the entire candidate set
-        s2_cands = [c for c in cands if c.startswith("S2-")]
-        self.assertLessEqual(len(s2_cands), CHANNEL_B_QUOTA)
-
-    def test_support_zero_one_and_many_candidates(self):
-        """Verify the pipeline supports 0, 1, and >10 candidates cleanly."""
+    def test_global_priority_scoring_prevents_address_displacement(self):
+        """
+        Verify that rare/specific name candidates score higher than
+        dense common-address noise candidates.
+        """
         import os
         from io import StringIO
-        from src.generate_candidates import _build_indexes, _generate_country_v3
+        from src.generate_candidates import _build_indexes, _generate_country_v4
+
+        s2_path = os.path.join(self.d, "s2_prio.tsv")
+        s3_path = os.path.join(self.d, "s3_prio.tsv")
+        s1_path = os.path.join(self.d, "s1_prio.tsv")
+
+        # 100 S2 entities with dense address 'Cyber Hub' but generic names
+        with open(s2_path, "w", encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            for i in range(1, 101):
+                f.write(f"S2-{i}\tRandom Firm {i}\tCyber Hub Building {i}\tIndia\n")
+
+        # 1 S3 entity with rare name 'QuantumX' but different address
+        with open(s3_path, "w", encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            f.write("S3-999\tQuantumX Innovations\tRemote Village\tIndia\n")
+
+        with open(s1_path, "w", encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            f.write("S1-1\tQuantumX\tCyber Hub Building 1\tIndia\n")
+
+        ni, pi, ai, pos_i, c3_i, rare_tokens = _build_indexes(s2_path, s3_path, "India")
+        out_buf = StringIO()
+
+        _generate_country_v4(
+            s1_path=s1_path, country="India",
+            ni=ni, pi=pi, ai=ai, pos_i=pos_i, c3_i=c3_i, rare_tokens=rare_tokens,
+            gt_arr=None, out_fh=out_buf,
+            budget_max=50,  # Force truncation to 50
+        )
+
+        cands = set(out_buf.getvalue().strip().split("\t")[1].split(","))
+        # QuantumX S3-999 must NOT be displaced by address noise
+        self.assertIn("S3-999", cands)
+
+    def test_true_character_3gram_fallback(self):
+        """
+        Verify that low-candidate entities (<40) trigger the true character 3-gram
+        fallback to recover typo / slight spelling variation matches.
+        """
+        import os
+        from io import StringIO
+        from src.generate_candidates import _build_indexes, _generate_country_v4
+
+        s2_path = os.path.join(self.d, "s2_3g.tsv")
+        s3_path = os.path.join(self.d, "s3_3g.tsv")
+        s1_path = os.path.join(self.d, "s1_3g.tsv")
+
+        # S2 has a name with middle typo: 'BioPharmaceutics' vs S1 'BioFarmaceutics'
+        # They share 0 tokens of len >= 3, and 5-char prefixes differ ('bioph' vs 'biofa')
+        with open(s2_path, "w", encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            f.write("S2-555\tBioPharmaceutics\tUnknown Road\tUS\n")
+
+        with open(s3_path, "w", encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            f.write("S3-1\tCompletely Unrelated Corp\tOther St\tUS\n")
+
+        with open(s1_path, "w", encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            f.write("S1-1\tBioFarmaceutics\tDifferent Ave\tUS\n")
+
+        ni, pi, ai, pos_i, c3_i, rare_tokens = _build_indexes(s2_path, s3_path, "US")
+        out_buf = StringIO()
+
+        stats = _generate_country_v4(
+            s1_path=s1_path, country="US",
+            ni=ni, pi=pi, ai=ai, pos_i=pos_i, c3_i=c3_i, rare_tokens=rare_tokens,
+            gt_arr=None, out_fh=out_buf,
+            fallback_trigger=40,
+        )
+
+        cands = set(out_buf.getvalue().strip().split("\t")[1].split(","))
+        self.assertEqual(stats["fallback_triggered"], 1)
+        self.assertIn("S2-555", cands)
+
+    def test_source_balancing_without_artificial_inflation(self):
+        """
+        Verify that when clamped to BUDGET_MAX, neither source starves the other,
+        and when one source has few candidates, no fake candidates are manufactured.
+        """
+        import os
+        from io import StringIO
+        from src.generate_candidates import _build_indexes, _generate_country_v4
+
+        s2_path = os.path.join(self.d, "s2_bal.tsv")
+        s3_path = os.path.join(self.d, "s3_bal.tsv")
+        s1_path = os.path.join(self.d, "s1_bal.tsv")
+
+        # S2 has 100 candidates, S3 has only 5 candidates
+        with open(s2_path, "w", encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            for i in range(1, 101):
+                f.write(f"S2-{i}\tGlobal Logistics {i}\tIndustrial Area\tUS\n")
+
+        with open(s3_path, "w", encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            for i in range(1, 6):
+                f.write(f"S3-{i}\tGlobal Logistics {i}\tIndustrial Area\tUS\n")
+
+        with open(s1_path, "w", encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            f.write("S1-1\tGlobal Logistics\tIndustrial Area\tUS\n")
+
+        ni, pi, ai, pos_i, c3_i, rare_tokens = _build_indexes(s2_path, s3_path, "US")
+        out_buf = StringIO()
+
+        # Clamp to budget_max = 20 (target 10 per source)
+        _generate_country_v4(
+            s1_path=s1_path, country="US",
+            ni=ni, pi=pi, ai=ai, pos_i=pos_i, c3_i=c3_i, rare_tokens=rare_tokens,
+            gt_arr=None, out_fh=out_buf,
+            budget_max=20,
+        )
+
+        cands = set(out_buf.getvalue().strip().split("\t")[1].split(","))
+        self.assertEqual(len(cands), 20)
+        s3_count = sum(1 for c in cands if c.startswith("S3-"))
+        s2_count = sum(1 for c in cands if c.startswith("S2-"))
+
+        # All 5 S3 candidates must be kept (not starved by 100 S2s, but not inflated to 10)
+        self.assertEqual(s3_count, 5)
+        # S2 takes the remaining 15 slots
+        self.assertEqual(s2_count, 15)
+
+    def test_open_set_country_handling(self):
+        """Verify open-set country handling for unseen countries (France, Germany)."""
+        import os
+        from io import StringIO
+        from src.generate_candidates import _build_indexes, _generate_country_v4
+
+        s2_path = os.path.join(self.d, "s2_fr.tsv")
+        s3_path = os.path.join(self.d, "s3_fr.tsv")
+        s1_path = os.path.join(self.d, "s1_fr.tsv")
+
+        with open(s2_path, "w", encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            f.write("S2-1\tBoulangerie Pierre SARL\t10 Rue Rivoli\tFrance\n")
+
+        with open(s3_path, "w", encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            f.write("S3-1\tPierre Boulangerie SAS\t10 Rue Rivoli\tFrance\n")
+
+        with open(s1_path, "w", encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            f.write("S1-1\tPierre Boulangerie\t10 Rue Rivoli\tFrance\n")
+
+        ni, pi, ai, pos_i, c3_i, rare_tokens = _build_indexes(s2_path, s3_path, "France")
+        out_buf = StringIO()
+
+        _generate_country_v4(
+            s1_path=s1_path, country="France",
+            ni=ni, pi=pi, ai=ai, pos_i=pos_i, c3_i=c3_i, rare_tokens=rare_tokens,
+            gt_arr=None, out_fh=out_buf,
+        )
+
+        cands = set(out_buf.getvalue().strip().split("\t")[1].split(","))
+        self.assertIn("S2-1", cands)
+        self.assertIn("S3-1", cands)
+
+    def test_support_zero_one_and_many_candidates(self):
+        """Verify 0, 1, and many candidates are output properly."""
+        import os
+        from io import StringIO
+        from src.generate_candidates import _build_indexes, _generate_country_v4
 
         s2_path = os.path.join(self.d, "s2_card.tsv")
         s3_path = os.path.join(self.d, "s3_card.tsv")
@@ -250,9 +361,7 @@ class TestV3BlockingEngineIntegration(unittest.TestCase):
 
         with open(s2_path, "w", encoding="utf-8") as f:
             f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
-            # 1 match for single
             f.write("S2-1\tAlpha Apex Solutions\t100 Main St\tUS\n")
-            # 15 matches for many
             for i in range(10, 25):
                 f.write(f"S2-{i}\tStarbucks Coffee {i}\tSeattle\tUS\n")
 
@@ -262,24 +371,17 @@ class TestV3BlockingEngineIntegration(unittest.TestCase):
 
         with open(s1_path, "w", encoding="utf-8") as f:
             f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
-            f.write("S1-1\tAlpha Apex\tMain St\tUS\n")          # exactly 1 match (S2-1)
+            f.write("S1-1\tAlpha Apex\tMain St\tUS\n")          # 1 match (S2-1)
             f.write("S1-2\tStarbucks Coffee\tSeattle\tUS\n")    # 15 matches (S2-10..24)
             f.write("S1-3\tZzz Unmatched Name\tUnknown\tUS\n")  # 0 matches
 
-        ni, pi, ai, pos_i, fpi, rare_tokens = _build_indexes(s2_path, s3_path, "US")
+        ni, pi, ai, pos_i, c3_i, rare_tokens = _build_indexes(s2_path, s3_path, "US")
         out_buf = StringIO()
 
-        stats = _generate_country_v3(
-            s1_path=s1_path,
-            country="US",
-            ni=ni,
-            pi=pi,
-            ai=ai,
-            pos_i=pos_i,
-            fpi=fpi,
-            rare_tokens=rare_tokens,
-            gt_arr=None,
-            out_fh=out_buf,
+        _generate_country_v4(
+            s1_path=s1_path, country="US",
+            ni=ni, pi=pi, ai=ai, pos_i=pos_i, c3_i=c3_i, rare_tokens=rare_tokens,
+            gt_arr=None, out_fh=out_buf,
         )
 
         lines = dict(l.split("\t") for l in out_buf.getvalue().split("\n") if l)
@@ -302,7 +404,7 @@ class TestDatasetPathResolution(unittest.TestCase):
     def setUp(self):
         import tempfile
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.td = Path(self.temp_dir.name)
+        self.td = Path(self.temp_dir.name).resolve()
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -348,7 +450,6 @@ class TestDatasetPathResolution(unittest.TestCase):
         from src.generate_candidates import get_dataset_paths
         train_dir = self.td / "train"
         train_dir.mkdir()
-        # Only create 1 file, leaving 3 missing
         (train_dir / "train_source1.tsv").touch()
         with self.assertRaises(FileNotFoundError) as ctx:
             get_dataset_paths(self.td, "validate")
@@ -358,5 +459,3 @@ class TestDatasetPathResolution(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-

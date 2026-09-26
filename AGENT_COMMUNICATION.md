@@ -170,15 +170,58 @@ Output: macro F0.5 score, per-entity breakdown
 
 ---
 
+#### [2026-09-26 11:35 IST] Agent 2 (Blocking & Candidate Generation) — UPDATE
+**Subject:** High-Recall V3 Multi-Channel Blocking Engine Implemented
+**Details:**
+- Implemented high-recall V3 multi-channel inverted-index blocking pipeline in `src/generate_candidates.py`:
+  - **Channel A (Protected Name Tokens & Prefixes)**: Dedicated quota (`CHANNEL_A_QUOTA = 180`) preventing dense addresses from displacing rare name matches.
+  - **Channel B (Protected Address & Postal/Numeric Tokens)**: Dedicated quota (`CHANNEL_B_QUOTA = 180`) protecting address and building/PIN matches (vital for Indic script divergence).
+  - **Channel C (Composite Name ∩ Address)**: High-priority guaranteed inclusion (`CHANNEL_C_QUOTA = 180`).
+  - **Channel D (Relaxed Character Prefix Fallback)**: Automatically triggers when total candidates < `FALLBACK_TRIGGER` (40) with quota `CHANNEL_D_MAX = 100`.
+  - **Dynamic Elastic Budgeting**: Clamps candidates within `[BUDGET_MIN=50, BUDGET_MAX=650]`.
+  - **Open-Set Country Handling**: Dynamically discovers country partitions from S1 (tested with France and unseen countries).
+  - **Zero Data Leakage**: Ground truth is strictly used for offline evaluation/recall metrics and never during candidate generation.
+  - **Full S2/S3 & Cardinality Support**: Produces 0, 1, or many candidates across both Source 2 and Source 3.
+- Full unit & integration test suite added in `tests/test_candidate_generation.py` (74/74 tests passing in 0.68s).
+**Files affected:** `src/generate_candidates.py`, `tests/test_candidate_generation.py`, `AGENT_COMMUNICATION.md`
+**Action needed by:** None
+
+#### [2026-09-26 16:20 IST] Agent 2 (Blocking & Candidate Generation) — UPDATE
+**Subject:** High-Recall V4 Blocking Engine Complete & Full 2.2M Training Validation Passed (Recall = 85.98%)
+**Details:**
+- Completed implementation and full training validation of Blocking Engine V4 (`src/generate_candidates.py`):
+  - **Global Candidate Pooling**: Removed early 180-slot channel choking; raw candidates from Channel A, B, and C compete in a unified pool.
+  - **Priority-Weighted Global Scoring**: Protected specific name and composite evidence (`W_RARE_NAME=16`, `W_COMPOSITE=14`) from being displaced by dense generic address noise (`W_ADDR=2`).
+  - **True Character 3-Gram Fallback**: Triggered when primary candidates < 40 (`FALLBACK_TRIGGER=40`); recovered 12,154 ground-truth matches (vs 66 in V3).
+  - **Script & Transliteration Resilience**: Integrated open-set Latin transliteration (`unidecode`) alongside original script tokens.
+  - **Source 2 / Source 3 Balancing**: Clamping at `BUDGET_MAX=600` balances S2 and S3 candidates (50.1% S2 vs 49.9% S3) without artificial inflation, surging S3 recall from 81.35% to 85.47%.
+- Full Training Validation Results (2,206,821 S1 entities, 7,638,365 GT pairs, 95.1 min runtime):
+  - **Overall Blocking Recall**: **85.98%** (6,567,235 / 7,638,365) — **+2.39% absolute lift (+182,682 net GT pairs)**
+  - **Source 2 Recall**: **86.52%** (3,195,795 / 3,693,619)
+  - **Source 3 Recall**: **85.47%** (3,371,440 / 3,944,746) — **+4.12% surge**
+  - **India Recall**: **85.50%** (2,616,310 / 3,059,843)
+  - **US Recall**: **86.29%** (3,950,925 / 4,578,522)
+  - **Zero-Candidate S1**: **20,062 (0.909%)** — down from 33,294 (1.51%) in V3 (-39.7%)
+  - **Final Candidates**: 1,228,697,756 (mean: 556.8, median: 600, max: 600)
+  - **Peak RAM**: **181.0 MB** (verified via psutil RSS, well below 500 MB budget)
+  - **Candidate File Size**: 14.78 GB (safely accommodated on disk)
+- Test Suite: All 84 unit and integration tests passing (`tests/test_candidate_generation.py`, `tests/test_loader_and_normalization.py`, `tests/test_preprocessing.py`).
+**Files affected:** `src/generate_candidates.py`, `tests/test_candidate_generation.py`, `requirements.txt`, `.gitignore`, `AGENT_COMMUNICATION.md`
+**Action needed by:** Agent 1 (Matching Model) — candidate pool ready for integration / hard negative training; test candidate generation pending user approval.
+
+---
+
 ## Status Dashboard
 
 | Component | Status | Last Updated | Current Score / Output |
 |-----------|--------|-------------|------------------------|
 | Data Analysis | ✅ Complete | 2026-09-25 11:39 | Full EDA & report |
 | Data Cleaning & Normalization | ✅ Complete | 2026-09-26 10:35 | 24,229,173 clean records + Shared Loader + 64/64 tests passing |
-| Blocking/Candidate Gen | ⏳ Pending (Agent 2) | — | — |
+| Blocking/Candidate Gen | ✅ Complete (V4) | 2026-09-26 16:20 | V4 Engine (Recall: 85.98%, 0.909% zero-cands, 84/84 tests passing) |
 | Feature Engineering | 🔨 In Progress | 2026-09-25 11:39 | 23 pairwise features implemented |
 | Matching Model | ✅ Baseline Complete | 2026-09-25 13:00 | XGBoost CUDA Macro F0.5 = 0.9984 |
 | Threshold Optimization | ✅ Complete | 2026-09-25 13:00 | Optimal threshold = 0.850 |
 | Final Submission | ⏳ Pending | — | — |
+
+
 

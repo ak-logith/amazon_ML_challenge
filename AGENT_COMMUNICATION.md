@@ -159,3 +159,4 @@ Output: macro F0.5 score, per-entity breakdown
 | Matching Model | ✅ Baseline Complete | 2026-09-25 13:00 | XGBoost CUDA Macro F0.5 = 0.9984 |
 | Threshold Optimization | ✅ Complete | 2026-09-25 13:00 | Optimal threshold = 0.850 |
 | Final Submission | ⏳ Pending | — | — |
+

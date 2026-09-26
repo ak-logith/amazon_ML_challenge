@@ -4,6 +4,7 @@ Unit tests for Candidate Generation & Blocking Engine (V3)
 """
 
 import unittest
+from pathlib import Path
 from src.generate_candidates import (
     _norm,
     _name_tokens,
@@ -295,6 +296,67 @@ class TestV3BlockingEngineIntegration(unittest.TestCase):
         self.assertEqual(lines["S1-3"], "")
 
 
+class TestDatasetPathResolution(unittest.TestCase):
+    """Unit tests for portable dataset path resolution and file validation."""
+
+    def setUp(self):
+        import tempfile
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.td = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_resolve_dataset_dir_direct(self):
+        from src.generate_candidates import resolve_dataset_dir
+        (self.td / "train").mkdir()
+        (self.td / "test").mkdir()
+        resolved = resolve_dataset_dir(str(self.td))
+        self.assertEqual(resolved, self.td)
+
+    def test_resolve_dataset_dir_nested(self):
+        from src.generate_candidates import resolve_dataset_dir
+        nested = self.td / "dataset"
+        nested.mkdir()
+        (nested / "train").mkdir()
+        (nested / "test").mkdir()
+        resolved = resolve_dataset_dir(str(self.td))
+        self.assertEqual(resolved, nested)
+
+    def test_get_dataset_paths_validate_success(self):
+        from src.generate_candidates import get_dataset_paths
+        train_dir = self.td / "train"
+        train_dir.mkdir()
+        for f in ("train_source1.tsv", "train_source2.tsv", "train_source3.tsv", "train_ground_truth.tsv"):
+            (train_dir / f).touch()
+        paths = get_dataset_paths(self.td, "validate")
+        self.assertTrue(paths["s1"].exists())
+        self.assertTrue(paths["gt"].exists())
+
+    def test_get_dataset_paths_generate_success(self):
+        from src.generate_candidates import get_dataset_paths
+        test_dir = self.td / "test"
+        test_dir.mkdir()
+        for f in ("test_source1.tsv", "test_source2.tsv", "test_source3.tsv"):
+            (test_dir / f).touch()
+        paths = get_dataset_paths(self.td, "generate")
+        self.assertTrue(paths["s1"].exists())
+        self.assertTrue(paths["s2"].exists())
+        self.assertTrue(paths["s3"].exists())
+
+    def test_get_dataset_paths_missing_files_raises(self):
+        from src.generate_candidates import get_dataset_paths
+        train_dir = self.td / "train"
+        train_dir.mkdir()
+        # Only create 1 file, leaving 3 missing
+        (train_dir / "train_source1.tsv").touch()
+        with self.assertRaises(FileNotFoundError) as ctx:
+            get_dataset_paths(self.td, "validate")
+        self.assertIn("Missing required dataset files", str(ctx.exception))
+        self.assertIn("train_source2.tsv", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

@@ -29,10 +29,11 @@ Key V3 Architecture Features:
 
 Usage:
 ------
-    python src/generate_candidates.py validate   # Evaluate on full train GT
-    python src/generate_candidates.py generate   # Generate candidates for test
+    python src/generate_candidates.py validate --data-dir "path/to/dataset"   # Evaluate on full train GT
+    python src/generate_candidates.py generate --data-dir "path/to/dataset"   # Generate candidates for test
 """
 
+import argparse
 import csv
 import gc
 import heapq
@@ -43,6 +44,8 @@ import time
 import unicodedata
 from array import array
 from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -55,23 +58,115 @@ if sys.stdout.encoding != "utf-8":
 
 # ───────────────────────────── Paths & Configuration ─────────────────────────────
 
-BASE = os.path.join(
-    r"e:\AMAZON ML CHALLENGE",
-    "6ab10eb3b23ba_student_resource", "student_resource", "dataset",
-)
-OUT = os.path.join(r"e:\AMAZON ML CHALLENGE", "amazon_ML_challenge", "output")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_OUT = REPO_ROOT / "output"
 
-TRAIN = dict(
-    s1=os.path.join(BASE, "train", "train_source1.tsv"),
-    s2=os.path.join(BASE, "train", "train_source2.tsv"),
-    s3=os.path.join(BASE, "train", "train_source3.tsv"),
-    gt=os.path.join(BASE, "train", "train_ground_truth.tsv"),
-)
-TEST = dict(
-    s1=os.path.join(BASE, "test", "test_source1.tsv"),
-    s2=os.path.join(BASE, "test", "test_source2.tsv"),
-    s3=os.path.join(BASE, "test", "test_source3.tsv"),
-)
+
+def _find_dataset_root(p: Path) -> Optional[Path]:
+    """Check if `p` or any of its standard child directories contains train/test dataset splits."""
+    if not p.exists():
+        return None
+    # 1. Direct folder containing 'train' (and optionally 'test')
+    if (p / "train").is_dir():
+        return p
+    # 2. Direct folder containing 'dataset/train'
+    if (p / "dataset" / "train").is_dir():
+        return p / "dataset"
+    # 3. Known challenge nested directory structures
+    nested_patterns = [
+        p / "6ab10eb3b23ba_student_resource" / "student_resource" / "dataset",
+        p / "student_resource" / "dataset",
+    ]
+    for n in nested_patterns:
+        if (n / "train").is_dir():
+            return n
+    return None
+
+
+def resolve_dataset_dir(user_path: Optional[str] = None) -> Path:
+    """
+    Resolve the root dataset directory containing 'train' and 'test' subdirectories.
+
+    Precedence:
+    1. Explicit user_path passed via --data-dir CLI argument
+    2. Environment variables: AMAZON_ML_DATA_DIR, DATASET_DIR
+    3. Auto-discovery relative to repository root:
+       - <repo>/dataset
+       - <repo>/data
+       - <repo>/../6ab10eb3b23ba_student_resource/student_resource/dataset
+       - <repo>/../dataset
+       - <repo>/../student_resource/dataset
+    """
+    if user_path:
+        p = Path(user_path).resolve()
+        found = _find_dataset_root(p)
+        if found:
+            return found
+        return p
+
+    # Check environment variables
+    for env_var in ("AMAZON_ML_DATA_DIR", "DATASET_DIR"):
+        env_val = os.environ.get(env_var)
+        if env_val:
+            found = _find_dataset_root(Path(env_val).resolve())
+            if found:
+                return found
+
+    # Auto-discovery relative to repo root
+    candidates = [
+        REPO_ROOT / "dataset",
+        REPO_ROOT / "data",
+        REPO_ROOT.parent / "6ab10eb3b23ba_student_resource" / "student_resource" / "dataset",
+        REPO_ROOT.parent / "dataset",
+        REPO_ROOT.parent / "student_resource" / "dataset",
+    ]
+    for cand in candidates:
+        found = _find_dataset_root(cand)
+        if found:
+            return found
+
+    # Sensible default fallback relative to repository
+    return REPO_ROOT / "dataset"
+
+
+def get_dataset_paths(data_dir: Path, mode: str) -> dict[str, Path]:
+    """
+    Validate that required files for `mode` ('validate' or 'generate') exist.
+    Raises FileNotFoundError with a clear informative message if any are missing.
+    """
+    split = "train" if mode == "validate" else "test"
+    split_dir = data_dir / split
+    if not split_dir.is_dir():
+        if (data_dir / f"{split}_source1.tsv").exists():
+            split_dir = data_dir
+
+    if mode == "validate":
+        required = {
+            "s1": split_dir / "train_source1.tsv",
+            "s2": split_dir / "train_source2.tsv",
+            "s3": split_dir / "train_source3.tsv",
+            "gt": split_dir / "train_ground_truth.tsv",
+        }
+    else:
+        required = {
+            "s1": split_dir / "test_source1.tsv",
+            "s2": split_dir / "test_source2.tsv",
+            "s3": split_dir / "test_source3.tsv",
+        }
+
+    missing = [name for name, p in required.items() if not p.exists()]
+    if missing:
+        missing_list = "\n".join(f"    - {name}: {required[name]}" for name in missing)
+        raise FileNotFoundError(
+            f"\n[ERROR] Missing required dataset files for mode '{mode}':\n"
+            f"{missing_list}\n"
+            f"  Resolved dataset directory: {data_dir}\n"
+            f"  Expected location of '{split}' split: {split_dir}\n"
+            f"Please specify the correct dataset path using:\n"
+            f"  python src/generate_candidates.py {mode} --data-dir <path_to_dataset_root>\n"
+            f"Or set the AMAZON_ML_DATA_DIR environment variable."
+        )
+    return required
 
 # ── Configurable Blocking & Indexing Hyper-parameters ──
 NAME_FREQ_CAP       = 6_000   # Drop name tokens appearing > N times per country
@@ -575,14 +670,19 @@ def _generate_country_v3(
 
 # ──────────────────────── Main Pipeline Runner ───────────────────────────
 
-def run(mode: str):
+def run(mode: str, data_dir: Optional[str] = None, output_dir: Optional[str] = None):
     assert mode in ("validate", "generate"), f"Unknown mode: {mode}"
-    paths = TRAIN if mode == "validate" else TEST
-    tag   = "VALIDATION (train ground truth)" if mode == "validate" else "PRODUCTION TEST GENERATION"
+    base_dir = resolve_dataset_dir(data_dir)
+    paths = get_dataset_paths(base_dir, mode)
+    out_dir = Path(output_dir).resolve() if output_dir else DEFAULT_OUT
+
+    tag = "VALIDATION (train ground truth)" if mode == "validate" else "PRODUCTION TEST GENERATION"
 
     print(f"\n{'=' * 70}", flush=True)
     print(f"  BLOCKING ENGINE V3 — {tag}", flush=True)
     print(f"{'=' * 70}", flush=True)
+    print(f"  Resolved Dataset Dir : {base_dir}", flush=True)
+    print(f"  Output Directory     : {out_dir}", flush=True)
 
     # ── Open-Set Country Discovery from S1 ──
     countries: set[str] = set()
@@ -600,11 +700,11 @@ def run(mode: str):
     # ── Ground Truth (Validation Mode Only) ──
     gt_arr = None
     if mode == "validate":
-        gt_arr = _load_gt(paths["gt"])
+        gt_arr = _load_gt(str(paths["gt"]))
 
     # ── Output TSV Setup ──
-    os.makedirs(OUT, exist_ok=True)
-    out_path = os.path.join(OUT, "train_candidate_pairs.tsv" if mode == "validate" else "candidate_pairs.tsv")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = out_dir / ("train_candidate_pairs.tsv" if mode == "validate" else "candidate_pairs.tsv")
     out_fh = open(out_path, "w", encoding="utf-8", newline="")
     out_fh.write("source1_entity_id\tcandidate_entity_ids\n")
 
@@ -620,11 +720,11 @@ def run(mode: str):
         tc = time.time()
 
         # Build Multi-Channel Indexes
-        ni, pi, ai, pos_i, fpi, rare_tokens = _build_indexes(paths["s2"], paths["s3"], country)
+        ni, pi, ai, pos_i, fpi, rare_tokens = _build_indexes(str(paths["s2"]), str(paths["s3"]), country)
 
         # Generate Candidates & Evaluate
         stats = _generate_country_v3(
-            paths["s1"], country, ni, pi, ai, pos_i, fpi, rare_tokens, gt_arr, out_fh,
+            str(paths["s1"]), country, ni, pi, ai, pos_i, fpi, rare_tokens, gt_arr, out_fh,
         )
 
         dt = time.time() - tc
@@ -724,8 +824,35 @@ def run(mode: str):
 
 
 if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "validate"
-    if mode not in ("validate", "generate"):
-        print(f"Usage: {sys.argv[0]} [validate|generate]")
+    parser = argparse.ArgumentParser(
+        description="High-Recall Multi-Channel Inverted-Index Blocking Engine (V3)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  python src/generate_candidates.py validate
+  python src/generate_candidates.py validate --data-dir "path/to/dataset"
+  python src/generate_candidates.py generate --data-dir "path/to/dataset" --output-dir "path/to/output"
+"""
+    )
+    parser.add_argument(
+        "mode",
+        choices=["validate", "generate"],
+        help="Pipeline execution mode: 'validate' (train ground truth) or 'generate' (test candidates)"
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Path to the dataset directory containing 'train' and 'test' subdirectories (or parent folder)"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory to save generated candidate TSV files (defaults to '<repo>/output')"
+    )
+    args = parser.parse_args()
+    try:
+        run(mode=args.mode, data_dir=args.data_dir, output_dir=args.output_dir)
+    except FileNotFoundError as e:
+        print(e, file=sys.stderr)
         sys.exit(1)
-    run(mode)

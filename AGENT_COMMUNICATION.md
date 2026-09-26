@@ -170,15 +170,34 @@ Output: macro F0.5 score, per-entity breakdown
 
 ---
 
+#### [2026-09-26 11:35 IST] Agent 2 (Blocking & Candidate Generation) — UPDATE
+**Subject:** High-Recall V3 Multi-Channel Blocking Engine Implemented
+**Details:**
+- Implemented high-recall V3 multi-channel inverted-index blocking pipeline in `src/generate_candidates.py`:
+  - **Channel A (Protected Name Tokens & Prefixes)**: Dedicated quota (`CHANNEL_A_QUOTA = 180`) preventing dense addresses from displacing rare name matches.
+  - **Channel B (Protected Address & Postal/Numeric Tokens)**: Dedicated quota (`CHANNEL_B_QUOTA = 180`) protecting address and building/PIN matches (vital for Indic script divergence).
+  - **Channel C (Composite Name ∩ Address)**: High-priority guaranteed inclusion (`CHANNEL_C_QUOTA = 180`).
+  - **Channel D (Relaxed Character Prefix Fallback)**: Automatically triggers when total candidates < `FALLBACK_TRIGGER` (40) with quota `CHANNEL_D_MAX = 100`.
+  - **Dynamic Elastic Budgeting**: Clamps candidates within `[BUDGET_MIN=50, BUDGET_MAX=650]`.
+  - **Open-Set Country Handling**: Dynamically discovers country partitions from S1 (tested with France and unseen countries).
+  - **Zero Data Leakage**: Ground truth is strictly used for offline evaluation/recall metrics and never during candidate generation.
+  - **Full S2/S3 & Cardinality Support**: Produces 0, 1, or many candidates across both Source 2 and Source 3.
+- Full unit & integration test suite added in `tests/test_candidate_generation.py` (74/74 tests passing in 0.68s).
+**Files affected:** `src/generate_candidates.py`, `tests/test_candidate_generation.py`, `AGENT_COMMUNICATION.md`
+**Action needed by:** None
+
+---
+
 ## Status Dashboard
 
 | Component | Status | Last Updated | Current Score / Output |
 |-----------|--------|-------------|------------------------|
 | Data Analysis | ✅ Complete | 2026-09-25 11:39 | Full EDA & report |
 | Data Cleaning & Normalization | ✅ Complete | 2026-09-26 10:35 | 24,229,173 clean records + Shared Loader + 64/64 tests passing |
-| Blocking/Candidate Gen | ⏳ Pending (Agent 2) | — | — |
+| Blocking/Candidate Gen | ✅ Complete (V3) | 2026-09-26 11:35 | Multi-Channel V3 Architecture + Quota Protection + 74/74 tests passing |
 | Feature Engineering | 🔨 In Progress | 2026-09-25 11:39 | 23 pairwise features implemented |
 | Matching Model | ✅ Baseline Complete | 2026-09-25 13:00 | XGBoost CUDA Macro F0.5 = 0.9984 |
 | Threshold Optimization | ✅ Complete | 2026-09-25 13:00 | Optimal threshold = 0.850 |
 | Final Submission | ⏳ Pending | — | — |
+
 

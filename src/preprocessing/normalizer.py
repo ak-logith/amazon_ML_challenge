@@ -19,10 +19,7 @@ import re
 import unicodedata
 from typing import Optional
 
-try:
-    from unidecode import unidecode
-except ImportError:
-    from text_unidecode import unidecode
+from unidecode import unidecode
 
 try:
     from . import config as C

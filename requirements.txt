@@ -1,4 +1,8 @@
-# Entity Resolution - Matching Model Dependencies
+# Data Preprocessing & Normalization
+polars>=1.0.0
+unidecode>=1.3.0
+
+# Matching Model & Feature Engineering
 numpy>=2.0
 pandas>=2.0
 lightgbm>=4.0

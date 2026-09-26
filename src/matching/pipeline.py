@@ -35,8 +35,15 @@ from typing import Optional, Tuple, Dict, Set, List
 
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
-import xgboost as xgb
+try:
+    import lightgbm as lgb
+except ImportError:
+    lgb = None
+
+try:
+    import xgboost as xgb
+except ImportError:
+    xgb = None
 from sklearn.model_selection import StratifiedShuffleSplit
 
 # Add project root to path

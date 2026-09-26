@@ -1,1 +1,2 @@
-# src package
+"""Business Entity Resolution Package."""
+

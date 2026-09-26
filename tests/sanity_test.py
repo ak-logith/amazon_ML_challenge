@@ -3,6 +3,8 @@ Quick sanity test of the matching pipeline on a small subset.
 Tests that all components work end-to-end before the full run.
 """
 
+__test__ = False  # Standalone benchmark script, not a pytest test case
+
 import sys
 import time
 import os

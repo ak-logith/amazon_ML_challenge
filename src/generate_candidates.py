@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Entity Resolution — Candidate Generation / Blocking Pipeline (V4)
-==================================================================
+Entity Resolution — Candidate Generation / Blocking Pipeline (V5.1)
+====================================================================
 High-Recall Multi-Channel Inverted-Index Blocking Engine with:
 - Global Candidate Pooling (Zero Early Quota Choking)
-- Priority-Weighted Global Scoring (Rare Name & Composite Dominate Noise)
-- True Character 3-Gram Fallback for Low-Candidate Entities (<40)
+- Priority-Weighted Global Scoring with Specificity Boosting (V5.1)
+- IDF-Aware Name Token Weighting (Rare / Standard / Common tiers)
+- Evidence-Based Dynamic Budgeting (compact→low, ambiguous→high)
+- True Character 3-Gram Fallback for Low-Name-Coverage Entities
 - Script / Transliteration Resilience (Open-Set ASCII + Original Script)
 - Proportional Source 2 / Source 3 Balancing Without Artificial Inflation
 - Open-Set Country Discovery (US, India, France, Germany, Arbitrary)
-- Dynamic Elastic Final Budgeting [BUDGET_MIN=50, BUDGET_MAX=600]
 
-Designed for memory-constrained environments (<500 MB peak RAM)
+Designed for memory-constrained environments (<1 GB peak RAM)
 and maximum pair completeness (Recall >= 95%).
 
 Usage:
@@ -110,6 +111,7 @@ def resolve_dataset_dir(user_path: Optional[str] = None) -> Path:
     candidates = [
         REPO_ROOT / "dataset",
         REPO_ROOT / "data",
+        REPO_ROOT.parent / "Given Resource" / "6ab10eb3b23ba_student_resource" / "student_resource" / "dataset",
         REPO_ROOT.parent / "6ab10eb3b23ba_student_resource" / "student_resource" / "dataset",
         REPO_ROOT.parent / "dataset",
         REPO_ROOT.parent / "student_resource" / "dataset",
@@ -162,8 +164,9 @@ def get_dataset_paths(data_dir: Path, mode: str) -> dict[str, Path]:
     return required
 
 
-# ── Configurable Blocking & Indexing Hyper-parameters ──
-NAME_FREQ_CAP       = 6_000   # Drop name tokens appearing > N times per country
+# ── Configurable Blocking & Indexing Hyper-parameters (V5.1) ──
+NAME_FREQ_CAP       = 25_000  # Drop name tokens appearing > N times per country (V5: raised from 6,000)
+NAME_MED_FREQ_CAP   = 6_000   # Tokens with df > N receive low retrieval priority (W_COMMON_NAME) (V5)
 ADDR_FREQ_CAP       = 3_000   # Drop generic addr tokens appearing > N times per country
 PREFIX_FREQ_CAP     = 8_000   # Drop prefixes appearing > N times per country
 POSTAL_FREQ_CAP     = 4_000   # Drop postal/numeric tokens appearing > N times per country
@@ -173,21 +176,29 @@ RARE_TOKEN_THRESH   = 250     # Tokens with document frequency <= N are marked "
 MIN_TOKEN_LEN       = 3       # Minimum token length for blocking keys
 PREFIX_LEN          = 5       # Chars used for prefix blocking keys
 
-# ── Dynamic Candidate Budget & Fallback Settings (V4) ──
+# ── Dynamic Candidate Budget & Fallback Settings (V5.1) ──
 # No early channel quota choking! These constants control global budgeting.
 BUDGET_MIN          = 50      # Target minimum candidate floor
-BUDGET_MAX          = 600     # Dynamic candidate cap for dense metropolitan entities
-FALLBACK_TRIGGER    = 40      # If total primary candidates < N, activate true 3-gram fallback
-FALLBACK_MAX_ADD    = 50      # Maximum candidate expansion from 3-gram fallback
+BUDGET_MAX          = 2000    # Hard ceiling for evidence-based dynamic budget (V5.1)
+BUDGET_BASE         = 800     # Base budget for typical entities (V5.1)
+FALLBACK_TRIGGER    = 10      # Trigger Channel D when name coverage is low: len(scores_a) < N (V5)
+FALLBACK_MAX_ADD    = 100     # Maximum candidate expansion from 3-gram fallback (V5: raised from 50)
 
-# ── Scoring Weights for Global Ranking (Prioritize High-Specificity Evidence) ──
-W_RARE_NAME         = 16      # High priority: exact rare name-token agreement
-W_NAME              = 6       # Standard name token agreement
+# ── Scoring Weights for Global Ranking (V5.1 Specificity Boosting) ──
+W_RARE_NAME         = 16      # High priority: exact rare name-token agreement (df <= 250)
+W_NAME              = 6       # Standard name token agreement (250 < df <= 6,000)
+W_COMMON_NAME       = 1       # Minimal weight: common name token agreement (6,000 < df <= 25,000) (V5.1)
 W_COMPOSITE_BONUS   = 14      # High priority: name + address intersection
 W_POSTAL_NUM        = 6       # Postal code / PIN / building number match
 W_ADDR              = 2       # Generic address token agreement (cannot overpower name)
 W_PREFIX            = 3       # 5-char prefix agreement
-W_3GRAM             = 4       # Score per shared character 3-gram in fallback
+W_3GRAM             = 6       # Score per shared character 3-gram in fallback (V5.1: raised from 4)
+
+# ── Specificity Boost Constants (V5.1) ──
+# Applied during composite score computation to elevate multi-evidence candidates
+SPECIFICITY_MULTI_NAME   = 20  # Bonus when candidate shares >= 2 distinct name tokens
+SPECIFICITY_NAME_POSTAL  = 18  # Bonus when candidate has strong name token + postal/numeric token
+SPECIFICITY_STRONG_COMP  = 16  # Bonus for strong composite agreement (high name + address scores)
 
 # ── Legal Suffixes (Multi-Lingual: US, India, France, EU, Global) ──
 SUFFIXES = frozenset({
@@ -353,10 +364,16 @@ def _build_indexes(s2_path: str, s3_path: str, country: str):
                 addr = p[2].strip() if len(p) > 2 else ""
 
                 # Channel A: Name tokens & 5-char prefixes (with transliteration)
-                for t in _name_tokens(name):
+                ntoks = _name_tokens(name)
+                for t in ntoks:
                     ni[t].append(code)
-                for pr in _name_prefixes(name, PREFIX_LEN):
-                    pi[pr].append(code)
+                seen_pref = set()
+                for t in ntoks:
+                    if len(t) >= PREFIX_LEN:
+                        pr = t[:PREFIX_LEN]
+                        if pr not in seen_pref:
+                            seen_pref.add(pr)
+                            pi[pr].append(code)
 
                 # Channel B: Address tokens & Postal/Numeric tokens
                 for t in _addr_tokens(addr):
@@ -366,9 +383,10 @@ def _build_indexes(s2_path: str, s3_path: str, country: str):
 
                 # Channel D: True Character 3-grams for names (and transliterations)
                 ngrams = set(_char_ngrams(name, 3))
-                t_name = _translit_clean(name)
-                if t_name and t_name != _norm(name):
-                    ngrams.update(_char_ngrams(t_name, 3))
+                if not name.isascii():
+                    t_name = _translit_clean(name)
+                    if t_name and t_name != _norm(name):
+                        ngrams.update(_char_ngrams(t_name, 3))
                 for ng in ngrams:
                     c3_i[ng].append(code)
 
@@ -441,7 +459,7 @@ def _gt_lookup(gt_arr, s1_num: int) -> set[int]:
     return set(gt_arr[lo:hi, 1].tolist())
 
 
-# ────────────── Candidate Generation per Country (V4 Engine) ───────────────
+# ────────────── Candidate Generation per Country (V5.1 Engine) ───────────────
 
 def _generate_country_v4(
     s1_path: str,
@@ -456,14 +474,15 @@ def _generate_country_v4(
     out_fh,
     budget_min: int = BUDGET_MIN,
     budget_max: int = BUDGET_MAX,
+    budget_base: int = BUDGET_BASE,
     fallback_trigger: int = FALLBACK_TRIGGER,
     sample_s1: Optional[int] = None,
 ):
     """
-    Stream S1 entities for `country`, compute raw channel candidate sets,
-    perform priority-weighted global scoring without early channel choking,
-    apply true 3-gram fallback for low-candidate entities,
-    and enforce dynamic elastic budgeting with Source 2/3 balancing.
+    V5.1 Engine: Stream S1 entities for `country`, compute raw channel candidate
+    sets with IDF-aware name weighting and specificity boosting, apply true
+    3-gram fallback for low-name-coverage entities, and enforce evidence-based
+    dynamic budgeting with Source 2/3 balancing.
     """
     stats = dict(
         total=0, with_cands=0, total_cands=0,
@@ -507,20 +526,29 @@ def _generate_country_v4(
             stats["total"] += 1
 
             ntoks = _name_tokens(name)
-            prefs = _name_prefixes(name, PREFIX_LEN)
+            prefs = [t[:PREFIX_LEN] for t in ntoks if len(t) >= PREFIX_LEN]
             atoks = _addr_tokens(addr)
             post_toks = _postal_and_numeric_tokens(addr)
 
             # ──────────────────────────────────────────────────────────
-            # CHANNEL A: Name Tokens & Prefixes (Raw Scores)
+            # CHANNEL A: Name Tokens & Prefixes (Raw Scores with IDF Weighting)
+            # V5.1: Also track distinct name token hits per candidate for specificity boost
             # ──────────────────────────────────────────────────────────
             scores_a: dict[int, int] = {}
+            name_hit_counts: dict[int, int] = {}   # V5.1: # of distinct name tokens hitting each candidate
             for t in ntoks:
                 arr_ = ni.get(t)
                 if arr_ is not None:
-                    w = W_RARE_NAME if t in rare_tokens else W_NAME
+                    df = len(arr_)
+                    if df <= RARE_TOKEN_THRESH:
+                        w = W_RARE_NAME
+                    elif df > NAME_MED_FREQ_CAP:
+                        w = W_COMMON_NAME
+                    else:
+                        w = W_NAME
                     for code in arr_:
                         scores_a[code] = scores_a.get(code, 0) + w
+                        name_hit_counts[code] = name_hit_counts.get(code, 0) + 1
 
             for pr in prefs:
                 arr_ = pi.get(pr)
@@ -528,10 +556,13 @@ def _generate_country_v4(
                     for code in arr_:
                         scores_a[code] = scores_a.get(code, 0) + W_PREFIX
 
+
             # ──────────────────────────────────────────────────────────
             # CHANNEL B: Address Tokens & Postal/Numeric Tokens (Raw Scores)
+            # V5.1: Track postal/numeric hit flag per candidate for specificity boost
             # ──────────────────────────────────────────────────────────
             scores_b: dict[int, int] = {}
+            postal_hits: set[int] = set()  # V5.1: candidates with postal/numeric match
             for t in atoks:
                 arr_ = ai.get(t)
                 if arr_ is not None:
@@ -543,6 +574,7 @@ def _generate_country_v4(
                 if arr_ is not None:
                     for code in arr_:
                         scores_b[code] = scores_b.get(code, 0) + W_POSTAL_NUM
+                        postal_hits.add(code)
 
             # ──────────────────────────────────────────────────────────
             # CHANNEL C: Composite Name ∩ Address (Raw Scores)
@@ -553,7 +585,10 @@ def _generate_country_v4(
                 scores_c[code] = scores_a[code] + scores_b[code] + W_COMPOSITE_BONUS
 
             # ──────────────────────────────────────────────────────────
-            # UNIFIED CANDIDATE POOL (No Early Quota Choking)
+            # UNIFIED CANDIDATE POOL with V5.1 Specificity Boosting
+            # No Early Quota Choking — all candidates enter the pool,
+            # then multi-evidence candidates receive score boosts to
+            # ensure they survive budget truncation.
             # ──────────────────────────────────────────────────────────
             all_raw_codes = set(scores_a.keys()) | set(scores_b.keys())
             composite_scores: dict[int, int] = {}
@@ -561,19 +596,35 @@ def _generate_country_v4(
                 sa = scores_a.get(code, 0)
                 sb = scores_b.get(code, 0)
                 sc = scores_c.get(code, 0)
-                composite_scores[code] = sc if sc > 0 else (sa + sb)
+                base = sc if sc > 0 else (sa + sb)
+
+                # V5.1 Specificity Boosts (non-destructive, additive)
+                nhits = name_hit_counts.get(code, 0)
+                # Boost 1: candidate shares >= 2 distinct name tokens
+                if nhits >= 2:
+                    base += SPECIFICITY_MULTI_NAME
+                # Boost 2: strong name token + postal/numeric match
+                if sa >= W_NAME and code in postal_hits:
+                    base += SPECIFICITY_NAME_POSTAL
+                # Boost 3: strong composite (both name and address evidence)
+                if sc >= (W_NAME + W_ADDR + W_COMPOSITE_BONUS):
+                    base += SPECIFICITY_STRONG_COMP
+
+                composite_scores[code] = base
 
             # ──────────────────────────────────────────────────────────
-            # CHANNEL D: True Character 3-Gram Fallback for Low-Candidate Entities
+            # CHANNEL D: True Character 3-Gram Fallback for Low-Name Coverage
+            # Decoupled from address noise: triggers when len(scores_a) < fallback_trigger
             # ──────────────────────────────────────────────────────────
             scores_d: dict[int, int] = {}
-            if len(composite_scores) < fallback_trigger:
+            if len(scores_a) < fallback_trigger:
                 stats["fallback_triggered"] += 1
                 c3_counts = Counter()
                 s1_ngrams = set(_char_ngrams(name, 3))
-                t_name = _translit_clean(name)
-                if t_name and t_name != _norm(name):
-                    s1_ngrams.update(_char_ngrams(t_name, 3))
+                if not name.isascii():
+                    t_name = _translit_clean(name)
+                    if t_name and t_name != _norm(name):
+                        s1_ngrams.update(_char_ngrams(t_name, 3))
 
                 for ng in s1_ngrams:
                     arr_ = c3_i.get(ng)
@@ -581,33 +632,55 @@ def _generate_country_v4(
                         for code in arr_:
                             c3_counts[code] += 1
 
-                # Take candidates with >= 2 shared 3-grams that aren't already included
+                # Take candidates with >= 2 shared 3-grams that aren't already in scores_a
                 fallback_candidates = [
                     (code, count * W_3GRAM)
                     for code, count in c3_counts.items()
-                    if count >= 2 and code not in composite_scores
+                    if count >= 2 and code not in scores_a
                 ]
 
                 if fallback_candidates:
                     top_fallback = heapq.nlargest(FALLBACK_MAX_ADD, fallback_candidates, key=lambda x: x[1])
                     for code, sc in top_fallback:
-                        composite_scores[code] = sc
+                        if code not in composite_scores:
+                            composite_scores[code] = sc
+                            stats["cands_from_fallback"] += 1
+                        else:
+                            composite_scores[code] += sc
                         scores_d[code] = sc
-                        stats["cands_from_fallback"] += 1
 
             # ──────────────────────────────────────────────────────────
-            # Dynamic Budget Clamping & Source 2 / Source 3 Balancing
+            # V5.1 Evidence-Based Dynamic Budgeting & Source Balancing
+            # Base budget = BUDGET_BASE (800). Expanded up to BUDGET_MAX
+            # (2000) only when there are many high-quality candidates
+            # (those with specificity boosts). This avoids wasting budget
+            # on generic noise while ensuring all strong evidence survives.
             # ──────────────────────────────────────────────────────────
             n_merged = len(composite_scores)
             stats["total_cands_before_trunc"] += n_merged
 
-            if n_merged > budget_max:
+            # Count high-quality candidates (those with any specificity boost)
+            specificity_threshold = W_NAME + W_ADDR  # minimum score for a meaningful candidate
+            high_quality_count = 0
+            for code, sc in composite_scores.items():
+                if sc >= specificity_threshold:
+                    high_quality_count += 1
+
+            # Dynamic budget: scale between min(budget_base, budget_max) and budget_max
+            # based on how many high-quality candidates exist
+            base_b = min(budget_base, budget_max)
+            if high_quality_count <= base_b:
+                effective_budget = base_b
+            else:
+                effective_budget = min(high_quality_count, budget_max)
+
+            if n_merged > effective_budget:
                 stats["capped_budget_max"] += 1
                 # Separate by Source (code > 0 is S2, code < 0 is S3)
                 s2_cands = [(c, score) for c, score in composite_scores.items() if c > 0]
                 s3_cands = [(c, score) for c, score in composite_scores.items() if c < 0]
 
-                target_per_source = budget_max // 2
+                target_per_source = effective_budget // 2
 
                 # Select top candidates per source without artificial inflation
                 top_s2 = heapq.nlargest(min(target_per_source, len(s2_cands)), s2_cands, key=lambda x: x[1])
@@ -616,7 +689,7 @@ def _generate_country_v4(
                 selected_codes = set(c for c, _ in top_s2) | set(c for c, _ in top_s3)
 
                 # If remaining budget exists, fill with highest remaining scores regardless of source
-                remaining_budget = budget_max - len(selected_codes)
+                remaining_budget = effective_budget - len(selected_codes)
                 if remaining_budget > 0:
                     remaining_pool = [
                         item for item in composite_scores.items()
@@ -712,8 +785,9 @@ def _generate_country_v4(
     return stats
 
 
-# Backward-compatible alias for unit tests
+# Backward-compatible aliases for unit tests
 _generate_country_v3 = _generate_country_v4
+_generate_country_v5 = _generate_country_v4
 
 
 # ──────────────────────── Main Pipeline Runner ───────────────────────────

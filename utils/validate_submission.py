@@ -91,7 +91,10 @@ def load_match_targets(test_dir, warnings):
     return targets
 
 
-def validate_id_list_file(path, expected_header, col_label, required, valid_ids, errors):
+def validate_id_list_file(
+    path, expected_header, col_label, required, valid_ids, errors,
+    store_mapping=True, matched_subset_check=None, warnings=None,
+):
     """Validate one results-style TSV (matching or candidate).
 
     Applies the shared formatting rules and appends any problems to ``errors``.
@@ -105,7 +108,7 @@ def validate_id_list_file(path, expected_header, col_label, required, valid_ids,
     name = os.path.basename(path)
     mapping = {}
     seen, dup_rows, intra_dupes = set(), set(), set()
-    self_matches, wrong_prefix, unknown = set(), set(), set()
+    self_matches, wrong_prefix, unknown, unsupported_cands = set(), set(), set(), set()
     n_rows = empties = 0
 
     with open(path, encoding="utf-8") as f:
@@ -146,12 +149,20 @@ def validate_id_list_file(path, expected_header, col_label, required, valid_ids,
             ids = rest.rstrip("\n").split(",") if rest.strip() else []
             if not ids:
                 empties += 1
-                mapping[s1] = set()
+                if matched_subset_check is not None:
+                    mids = matched_subset_check.get(s1)
+                    if mids:
+                        unsupported_cands.add(s1)
                 continue
             if len(ids) != len(set(ids)):
                 intra_dupes.add(s1)
             id_set = set(ids)
-            mapping[s1] = id_set
+            if store_mapping:
+                mapping[s1] = id_set
+            if matched_subset_check is not None:
+                mids = matched_subset_check.get(s1)
+                if mids and (mids - id_set):
+                    unsupported_cands.add(s1)
             for mid in id_set:
                 if mid.startswith("S1-"):
                     self_matches.add(mid)
@@ -201,8 +212,15 @@ def validate_id_list_file(path, expected_header, col_label, required, valid_ids,
         if offenders:
             errors.append(message.format(name=name, ex=examples(offenders), col=col_label))
 
+    if unsupported_cands and warnings is not None:
+        warnings.append(
+            f"{len(unsupported_cands)} S1 entity(ies) have matched IDs not present in "
+            f"candidate_pairs.tsv, e.g. {examples(unsupported_cands)}. Final matches "
+            "normally come from your blocking candidates — double-check these."
+        )
+
     print(f"  {name}: {n_rows} rows ({empties} empty, {n_rows - empties} non-empty).")
-    return mapping
+    return mapping if store_mapping else None
 
 
 def validate(matching_path, candidate_path, test_dir, check_ids=False):
@@ -236,7 +254,8 @@ def validate(matching_path, candidate_path, test_dir, check_ids=False):
         )
 
     matched = validate_id_list_file(
-        matching_path, MATCHING_HEADER, "matched_entity_ids", required, valid_ids, errors
+        matching_path, MATCHING_HEADER, "matched_entity_ids", required, valid_ids, errors,
+        store_mapping=True,
     )
 
     # candidate_pairs.tsv is optional: if it's absent we skip its checks with a
@@ -247,6 +266,7 @@ def validate(matching_path, candidate_path, test_dir, check_ids=False):
         candidate = validate_id_list_file(
             candidate_path, CANDIDATE_HEADER, "candidate_entity_ids",
             required, valid_ids, errors,
+            store_mapping=False, matched_subset_check=matched, warnings=warnings,
         )
     elif candidate_path:
         warnings.append(
@@ -256,9 +276,9 @@ def validate(matching_path, candidate_path, test_dir, check_ids=False):
         )
 
     # Soft check: your final matches should come from your blocking candidates.
-    # A matched ID absent from candidate_pairs.tsv usually means a pipeline bug,
-    # so we warn but never fail on it.
-    if matched is not None and candidate is not None:
+    # When candidate is None (due to streaming validation), this check has already
+    # run streaming during validate_id_list_file above.
+    if matched is not None and candidate:
         offenders = {
             s1 for s1, mids in matched.items() if mids - candidate.get(s1, set())
         }

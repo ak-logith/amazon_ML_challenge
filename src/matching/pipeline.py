@@ -52,8 +52,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.matching.features import compute_pair_features, FEATURE_NAMES
 
+from src.generate_candidates import resolve_dataset_dir
+
 # ── Configuration ────────────────────────────────────────────────────────
-DATA_DIR = Path(r"e:\Projects\Amazon ML Challenge\Given Resource\6ab10eb3b23ba_student_resource\student_resource\dataset")
+DATA_DIR = resolve_dataset_dir()
 TRAIN_DIR = DATA_DIR / "train"
 TEST_DIR = DATA_DIR / "test"
 OUTPUT_DIR = PROJECT_ROOT / "output"

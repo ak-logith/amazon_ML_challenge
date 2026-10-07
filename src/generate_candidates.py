@@ -477,6 +477,7 @@ def _generate_country_v4(
     budget_base: int = BUDGET_BASE,
     fallback_trigger: int = FALLBACK_TRIGGER,
     sample_s1: Optional[int] = None,
+    existing_s1_ids: Optional[set] = None,
 ):
     """
     V5.1 Engine: Stream S1 entities for `country`, compute raw channel candidate
@@ -517,10 +518,13 @@ def _generate_country_v4(
             if len(p) < 4 or p[3].strip() != country:
                 continue
 
+            eid  = p[0].strip()
+            if existing_s1_ids and eid in existing_s1_ids:
+                continue
+
             if sample_s1 is not None and stats["total"] >= sample_s1:
                 break
 
-            eid  = p[0].strip()
             name = p[1].strip() if len(p) > 1 else ""
             addr = p[2].strip() if len(p) > 2 else ""
             stats["total"] += 1
@@ -800,6 +804,7 @@ def run(
     budget_max: int = BUDGET_MAX,
     fallback_trigger: int = FALLBACK_TRIGGER,
     sample_s1: Optional[int] = None,
+    resume: bool = True,
 ):
     assert mode in ("validate", "generate"), f"Unknown mode: {mode}"
     base_dir = resolve_dataset_dir(data_dir)
@@ -817,8 +822,8 @@ def run(
     if sample_s1:
         print(f"  Diagnostic Sample Cap: {sample_s1:,} S1 entities per country", flush=True)
 
-    # ── Open-Set Country Discovery from S1 ──
-    countries: set[str] = set()
+    # ── Open-Set Country Discovery & Entity Counts from S1 ──
+    country_s1_total = Counter()
     with open(paths["s1"], "r", encoding="utf-8", errors="replace") as fh:
         fh.readline()
         for line in fh:
@@ -826,8 +831,8 @@ def run(
             if len(p) >= 4:
                 c = p[3].strip()
                 if c:
-                    countries.add(c)
-    sorted_countries = sorted(countries)
+                    country_s1_total[c] += 1
+    sorted_countries = sorted(country_s1_total.keys())
     print(f"Discovered Countries in S1 ({len(sorted_countries)}): {sorted_countries}", flush=True)
 
     # ── Ground Truth (Validation Mode Only) ──
@@ -835,11 +840,54 @@ def run(
     if mode == "validate":
         gt_arr = _load_gt(str(paths["gt"]))
 
-    # ── Output TSV Setup ──
+    # ── Output TSV Setup & Resume Handling ──
     os.makedirs(out_dir, exist_ok=True)
     out_path = out_dir / ("train_candidate_pairs.tsv" if mode == "validate" else "candidate_pairs.tsv")
-    out_fh = open(out_path, "w", encoding="utf-8", newline="")
-    out_fh.write("source1_entity_id\tcandidate_entity_ids\n")
+
+    existing_s1_ids = set()
+    if resume and out_path.exists() and os.path.getsize(out_path) > 0:
+        # 1. Clean up any trailing partial line from an interrupted run
+        with open(out_path, "r+b") as fb:
+            fb.seek(0, 2)
+            tot = fb.tell()
+            if tot > 0:
+                read_sz = min(tot, 131072)
+                fb.seek(tot - read_sz)
+                buf = fb.read()
+                last_nl = buf.rfind(b"\n")
+                if last_nl != -1 and (tot - read_sz + last_nl + 1) < tot:
+                    trunc_pos = tot - read_sz + last_nl + 1
+                    print(f"  [RESUME] Truncating trailing partial line ({tot - trunc_pos} bytes) at offset {trunc_pos}...", flush=True)
+                    fb.seek(trunc_pos)
+                    fb.truncate()
+
+        # 2. Collect existing S1 IDs
+        with open(out_path, "r", encoding="utf-8", errors="replace") as f:
+            f.readline()  # Skip header
+            for line in f:
+                idx = line.find("\t")
+                if idx != -1:
+                    existing_s1_ids.add(line[:idx].strip())
+        print(f"  [RESUME] Found {len(existing_s1_ids):,} already completed S1 entities in {out_path.name}", flush=True)
+
+    # Determine country completion status in existing_s1_ids
+    country_done_counts = Counter()
+    if existing_s1_ids:
+        with open(paths["s1"], "r", encoding="utf-8", errors="replace") as fh:
+            fh.readline()
+            for line in fh:
+                p = line.rstrip("\n").split("\t")
+                if len(p) >= 4:
+                    eid = p[0].strip()
+                    c = p[3].strip()
+                    if eid in existing_s1_ids:
+                        country_done_counts[c] += 1
+
+    if existing_s1_ids:
+        out_fh = open(out_path, "a", encoding="utf-8", newline="")
+    else:
+        out_fh = open(out_path, "w", encoding="utf-8", newline="")
+        out_fh.write("source1_entity_id\tcandidate_entity_ids\n")
 
     cumulative = defaultdict(int)
     all_sample_cand_counts = []
@@ -847,6 +895,23 @@ def run(
     t_start = time.time()
 
     for country in sorted_countries:
+        total_in_country = country_s1_total[country]
+        done_in_country = country_done_counts[country]
+        target_in_country = min(sample_s1, total_in_country) if sample_s1 is not None else total_in_country
+
+        if done_in_country >= target_in_country:
+            print(f"\n{'-' * 60}", flush=True)
+            print(f"  [{country}] All {done_in_country:,} / {target_in_country:,} S1 entities already completed in {out_path.name}. Skipping.", flush=True)
+            print(f"{'-' * 60}", flush=True)
+            cumulative["total"] += done_in_country
+            continue
+
+        if done_in_country > 0:
+            print(f"\n{'-' * 60}", flush=True)
+            print(f"  [{country}] Resuming partition: {done_in_country:,} already completed, {target_in_country - done_in_country:,} remaining.", flush=True)
+            print(f"{'-' * 60}", flush=True)
+            cumulative["total"] += done_in_country
+
         print(f"\n{'-' * 60}", flush=True)
         print(f"  Processing Country Partition: {country}", flush=True)
         print(f"{'-' * 60}", flush=True)
@@ -862,6 +927,7 @@ def run(
             budget_max=budget_max,
             fallback_trigger=fallback_trigger,
             sample_s1=sample_s1,
+            existing_s1_ids=existing_s1_ids if existing_s1_ids else None,
         )
 
         dt = time.time() - tc
@@ -1017,6 +1083,18 @@ if __name__ == "__main__":
         default=None,
         help="Limit number of S1 entities per country for fast diagnostic evaluation"
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=True,
+        help="Resume from existing candidate TSV file if present (default: True)"
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        default=False,
+        help="Overwrite existing candidate TSV file instead of resuming"
+    )
     args = parser.parse_args()
     try:
         run(
@@ -1027,6 +1105,7 @@ if __name__ == "__main__":
             budget_max=args.budget_max,
             fallback_trigger=args.fallback_trigger,
             sample_s1=args.sample_s1,
+            resume=not args.overwrite,
         )
     except FileNotFoundError as e:
         print(e, file=sys.stderr)

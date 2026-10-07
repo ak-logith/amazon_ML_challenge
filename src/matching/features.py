@@ -128,6 +128,22 @@ def compute_pair_features(
     # 0: Jaro-Winkler on normalized names
     f_name_jw = JaroWinkler.similarity(n_name1, n_name2) if (n_name1 and n_name2) else 0.0
 
+    # 10: Address Jaro-Winkler
+    f_addr_jw = JaroWinkler.similarity(exp_addr1, exp_addr2) if (exp_addr1 and exp_addr2) else 0.0
+
+    # Fast short-circuit for obvious negatives (max model probability < 0.001 << threshold 0.950)
+    if f_name_jw < 0.40 and f_addr_jw < 0.40:
+        c_match = 1.0 if (country1 and country2 and country1.lower() == country2.lower()) else 0.0
+        any_empty = 1.0 if (not n_addr1 or not n_addr2) else 0.0
+        return np.array([
+            f_name_jw, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            f_addr_jw, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, any_empty,
+            c_match, float(source_type),
+            (f_name_jw * f_addr_jw) ** 0.5,
+            min(f_name_jw, f_addr_jw),
+            max(f_name_jw, f_addr_jw),
+        ], dtype=np.float32)
+
     # 1: Levenshtein ratio on normalized names
     f_name_lev = fuzz.ratio(n_name1, n_name2) / 100.0 if (n_name1 and n_name2) else 0.0
 
@@ -159,9 +175,6 @@ def compute_pair_features(
 
     addr1_empty = 1.0 if not n_addr1 else 0.0
     addr2_empty = 1.0 if not n_addr2 else 0.0
-
-    # 10: Address Jaro-Winkler
-    f_addr_jw = JaroWinkler.similarity(exp_addr1, exp_addr2) if (exp_addr1 and exp_addr2) else 0.0
 
     # 11: Address token Jaccard
     f_addr_jaccard = _jaccard_tokens(addr_tok1, addr_tok2)

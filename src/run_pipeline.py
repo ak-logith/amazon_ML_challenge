@@ -45,6 +45,7 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from rapidfuzz.distance import JaroWinkler
 from src.matching.features import compute_pair_features, FEATURE_NAMES
 from src.generate_candidates import run as run_blocker, resolve_dataset_dir
 
@@ -53,7 +54,7 @@ MODEL_DIR = PROJECT_ROOT / "models"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 NUM_WORKERS = 8
 CHUNK_SIZE = 5_000       # Pairs per parallel chunk for feature computation
-SCORE_BATCH = 200_000    # S1 entities per scoring batch (controls peak RAM)
+SCORE_BATCH = 10_000     # S1 entities per scoring batch (bounds RAM to < 4 GB)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -135,11 +136,14 @@ def _compute_chunk(chunk_data: list) -> np.ndarray:
     return np.array(rows, dtype=np.float32) if rows else np.empty((0, len(FEATURE_NAMES)), dtype=np.float32)
 
 
+SCORE_BATCH = 1_000      # S1 entities per scoring batch (bounds RAM and prevents IPC pipe overflow)
+
 def compute_features_for_batch(
     pairs: list,  # [(s1_id, cand_id), ...]
     s1_records: dict,
     s2_records: dict,
     s3_records: dict,
+    executor: Optional[ProcessPoolExecutor] = None,
 ) -> np.ndarray:
     """Compute features for a batch of pairs using parallel workers."""
     # Build payloads
@@ -164,8 +168,11 @@ def compute_features_for_batch(
 
     chunks = [payloads[i:i + CHUNK_SIZE] for i in range(0, n, CHUNK_SIZE)]
 
-    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+    if executor is not None:
         matrices = list(executor.map(_compute_chunk, chunks))
+    else:
+        with ProcessPoolExecutor(max_workers=NUM_WORKERS) as pool:
+            matrices = list(pool.map(_compute_chunk, chunks))
 
     return np.vstack(matrices)
 
@@ -200,8 +207,40 @@ def load_model():
 # 4. STREAMING SCORING PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════
 
+def stream_candidate_batches(cand_input, batch_size: int = SCORE_BATCH):
+    """Yield batches of (s1_id, [cand_ids]) from a TSV file path or dict without loading all into RAM."""
+    if isinstance(cand_input, (str, Path)):
+        with open(cand_input, "r", encoding="utf-8") as f:
+            f.readline()  # Skip header
+            batch = []
+            for line in f:
+                line_str = line.rstrip("\n")
+                if not line_str:
+                    continue
+                idx = line_str.find("\t")
+                if idx == -1:
+                    s1_id = line_str.strip()
+                    cands = []
+                else:
+                    s1_id = line_str[:idx].strip()
+                    cand_str = line_str[idx + 1:].strip()
+                    cands = [c.strip() for c in cand_str.split(",") if c.strip()] if cand_str else []
+                batch.append((s1_id, cands))
+                if len(batch) >= batch_size:
+                    yield batch
+                    batch = []
+            if batch:
+                yield batch
+    elif isinstance(cand_input, dict):
+        items = list(cand_input.items())
+        for i in range(0, len(items), batch_size):
+            yield items[i:i + batch_size]
+    else:
+        raise TypeError(f"Expected file Path, str, or dict for candidates, got {type(cand_input)}")
+
+
 def score_candidates_streaming(
-    candidates: dict,       # {s1_id: [cand_ids]}
+    candidates,             # Path, str, or dict {s1_id: [cand_ids]}
     s1_records: dict,
     s2_records: dict,
     s3_records: dict,
@@ -209,6 +248,7 @@ def score_candidates_streaming(
     threshold: float,
     output_path: Path,
     gt: Optional[dict] = None,
+    batch_size: int = SCORE_BATCH,
 ):
     """
     Score all candidate pairs in streaming batches to keep RAM bounded.
@@ -219,15 +259,14 @@ def score_candidates_streaming(
     log.info("=" * 70)
     log.info("SCORING CANDIDATES → matching_results.tsv")
     log.info(f"  Threshold: {threshold:.3f}")
-    log.info(f"  Batch size: {SCORE_BATCH:,} S1 entities")
+    log.info(f"  Batch size: {batch_size:,} S1 entities")
     log.info("=" * 70)
 
     os.makedirs(output_path.parent, exist_ok=True)
     out_fh = open(output_path, "w", encoding="utf-8", newline="")
     out_fh.write("source1_entity_id\tmatched_entity_ids\n")
 
-    s1_ids = list(candidates.keys())
-    total_s1 = len(s1_ids)
+    total_s1 = 0
     total_pairs = 0
     total_matches = 0
     total_scored = 0
@@ -238,43 +277,43 @@ def score_candidates_streaming(
     t_start = time.time()
     batch_idx = 0
 
-    for batch_start in range(0, total_s1, SCORE_BATCH):
-        batch_end = min(batch_start + SCORE_BATCH, total_s1)
-        batch_s1 = s1_ids[batch_start:batch_end]
-        batch_idx += 1
+    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        for batch in stream_candidate_batches(candidates, batch_size=batch_size):
+            batch_idx += 1
+            batch_s1 = [item[0] for item in batch]
+            total_s1 += len(batch_s1)
 
-        # Build pairs for this batch
-        batch_pairs = []
-        batch_s1_offsets = {}  # s1_id -> (start_idx, count) in batch_pairs
-        for s1_id in batch_s1:
-            cand_ids = candidates.get(s1_id, [])
-            start = len(batch_pairs)
-            for cid in cand_ids:
-                batch_pairs.append((s1_id, cid))
-            batch_s1_offsets[s1_id] = (start, len(cand_ids))
+            # Build pairs for this batch
+            batch_pairs = []
+            batch_s1_offsets = {}  # s1_id -> (start_idx, count) in batch_pairs
+            for s1_id, cand_ids in batch:
+                start = len(batch_pairs)
+                for cid in cand_ids:
+                    batch_pairs.append((s1_id, cid))
+                batch_s1_offsets[s1_id] = (start, len(cand_ids))
 
-        n_pairs = len(batch_pairs)
-        total_pairs += n_pairs
+            n_pairs = len(batch_pairs)
+            total_pairs += n_pairs
 
-        if n_pairs > 0:
-            # Compute features
-            t_feat = time.time()
-            X = compute_features_for_batch(batch_pairs, s1_records, s2_records, s3_records)
-            feat_time = time.time() - t_feat
+            if n_pairs > 0:
+                # Compute features
+                t_feat = time.time()
+                X = compute_features_for_batch(batch_pairs, s1_records, s2_records, s3_records, executor=executor)
+                feat_time = time.time() - t_feat
 
-            # Predict
-            t_pred = time.time()
-            probs = model.predict_proba(X)[:, 1]
-            pred_time = time.time() - t_pred
+                # Predict
+                t_pred = time.time()
+                probs = model.predict_proba(X)[:, 1]
+                pred_time = time.time() - t_pred
 
-            total_scored += n_pairs
-            rate = n_pairs / max(feat_time, 0.001)
-            log.info(
-                f"  Batch {batch_idx}: {len(batch_s1):,} S1, {n_pairs:,} pairs | "
-                f"features {feat_time:.1f}s ({rate:,.0f}/s) | predict {pred_time:.1f}s"
-            )
-        else:
-            probs = np.array([])
+                total_scored += n_pairs
+                rate = n_pairs / max(feat_time, 0.001)
+                log.info(
+                    f"  Batch {batch_idx}: {len(batch_s1):,} S1, {n_pairs:,} pairs | "
+                    f"features {feat_time:.1f}s ({rate:,.0f}/s) | predict {pred_time:.1f}s"
+                )
+            else:
+                probs = np.array([])
 
         # Apply threshold and write results
         batch_matches = 0
@@ -316,12 +355,13 @@ def score_candidates_streaming(
                 all_f05_scores.append(f05)
 
         # Free batch memory
-        del X, probs if n_pairs > 0 else None
+        if n_pairs > 0:
+            del X, probs
         gc.collect()
 
         elapsed = time.time() - t_start
         log.info(
-            f"    → {batch_end:,}/{total_s1:,} S1 done | "
+            f"    → {total_s1:,} S1 done | "
             f"{total_matches:,} matches | {elapsed:.0f}s elapsed"
         )
 
@@ -413,8 +453,7 @@ def run_full_pipeline(
     s2 = load_source_records(split_dir / f"{split}_source2.tsv")
     s3 = load_source_records(split_dir / f"{split}_source3.tsv")
 
-    candidates = load_candidates(cand_path)
-
+    # Candidates are streamed line-by-line from cand_path to keep RAM bounded
     gt = None
     if is_validate:
         gt = load_ground_truth(split_dir / f"{split}_ground_truth.tsv")
@@ -430,7 +469,7 @@ def run_full_pipeline(
     match_path = out_dir / match_filename
 
     total_s1, total_scored, total_matches, eval_metrics = score_candidates_streaming(
-        candidates=candidates,
+        candidates=cand_path,
         s1_records=s1,
         s2_records=s2,
         s3_records=s3,

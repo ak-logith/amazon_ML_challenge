@@ -12,3 +12,9 @@ output/
 .DS_Store
 *.tmp
 *.tsv
+*.zip
+dataset/
+scratch/
+staging/
+*.code-workspace
+.vscode/
